@@ -1,0 +1,334 @@
+name: Multi-Agent Platform CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # Stage 1: Code Quality
+  # ─────────────────────────────────────────────────────────
+  quality:
+    name: Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Run Python linters
+        run: |
+          pip install black ruff mypy
+          black --check backend/
+          ruff check backend/
+          mypy backend/ --ignore-missing-imports
+      
+      - name: Run Python tests
+        run: |
+          cd backend
+          pip install -e ".[dev]"
+          pytest tests/ --tb=short --strict-markers
+      
+      - name: Run Node.js linter
+        run: |
+          cd frontend
+          npm ci
+          npm run lint
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 2: Backend Tests
+  # ─────────────────────────────────────────────────────────
+  test-backend:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: agent_platform_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -e ".[dev]"
+      
+      - name: Run tests with coverage
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/agent_platform_test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          cd backend
+          pytest tests/ \
+            --cov=agents \
+            --cov=memory \
+            --cov=models \
+            --cov=api \
+            --cov-report=xml \
+            --cov-report=html \
+            --tb=short
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 3: Frontend Tests
+  # ─────────────────────────────────────────────────────────
+  test-frontend:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install dependencies
+        run: |
+          cd frontend
+          npm ci
+      
+      - name: Run tests
+        run: |
+          cd frontend
+          npm run test:ci
+      
+      - name: Run E2E tests
+        uses: cypress-io/github-action@v5
+        with:
+          project: frontend
+          browser: chrome
+          config: video=false
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 4: AI Evaluation Tests
+  # ─────────────────────────────────────────────────────────
+  ai-evaluation:
+    name: AI Evaluation Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pip install anthropic
+      
+      - name: Run AI evaluation tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cd backend
+          pytest tests/ai/ -v --tb=short
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 5: Build & Security
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build Containers
+    runs-on: ubuntu-latest
+    needs: [quality, test-backend, test-frontend]
+    if: github.event_name == 'push'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infrastructure/docker/Dockerfile.backend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infrastructure/docker/Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/frontend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+      
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 6: Deploy to Staging
+  # ─────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+      
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f infrastructure/k8s/namespace.yaml
+          kubectl apply -f infrastructure/k8s/secrets.yaml
+          kubectl apply -f infrastructure/k8s/deployment.yaml
+          kubectl set image deployment/agent-platform-api api=${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}
+          kubectl set image deployment/agent-platform-frontend frontend=${{ env.REGISTRY }}/${{ github.repository }}/frontend:${{ github.sha }}
+          kubectl rollout status deployment/agent-platform-api -n agent-platform
+          kubectl rollout status deployment/agent-platform-frontend -n agent-platform
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 7: Canary Deploy to Production
+  # ─────────────────────────────────────────────────────────
+  deploy-canary:
+    name: Canary Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+      
+      - name: Canary deployment (10% traffic)
+        run: |
+          kubectl patch deployment agent-platform-api -n agent-platform -p '{"spec":{"replicas":1}}'
+          kubectl set image deployment/agent-platform-api api=${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}
+          kubectl rollout status deployment/agent-platform-api -n agent-platform
+          echo "Canary deployed to 1 pod"
+
+  # ─────────────────────────────────────────────────────────
+  # Stage 8: Full Production Deployment
+  # ─────────────────────────────────────────────────────────
+  deploy-production:
+    name: Full Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-canary]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+      
+      - name: Full production deployment
+        run: |
+          # Scale up to production replicas
+          kubectl scale deployment agent-platform-api -n agent-platform --replicas=3
+          kubectl set image deployment/agent-platform-api api=${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}
+          kubectl set image deployment/agent-platform-frontend frontend=${{ env.REGISTRY }}/${{ github.repository }}/frontend:${{ github.sha }}
+          
+          # Wait for rollout
+          kubectl rollout status deployment/agent-platform-api -n agent-platform --timeout=10m
+          kubectl rollout status deployment/agent-platform-frontend -n agent-platform --timeout=5m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n agent-platform
+          kubectl get services -n agent-platform
